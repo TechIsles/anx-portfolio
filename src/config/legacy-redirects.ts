@@ -7,6 +7,12 @@
  * another legacy URL shows up in Search Console.
  */
 export const LEGACY_REDIRECTS = [
+  {
+    source: "/scripts/update-skill.py",
+    destination:
+      "https://raw.githubusercontent.com/AnxForever/stylekit-skill/main/scripts/update-skill.py",
+    permanent: true,
+  },
   { source: "/projects", destination: "/", permanent: true },
   { source: "/about", destination: "/", permanent: true },
   {

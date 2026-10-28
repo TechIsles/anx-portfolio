@@ -2,7 +2,7 @@
 title: StyleKit 工具怎么用：MCP、CLI、Skill 和更新方式
 description: 从网页选风格，到在 AI 编码工具里查风格、取设计资料、导出模板和检查代码。说明 MCP、CLI、Skill 各自做什么，公开资产覆盖范围，以及安装后的更新方式。
 createdAt: 2026-09-29
-updatedAt: 2026-10-02
+updatedAt: 2026-10-27
 ---
 
 选好一套网页风格之后，接下来常常要做几件重复的事：找设计参数、翻组件例子、把模板拷进项目，再检查生成的代码有没有偏离这套风格。StyleKit 把这些资料放在 [网站](https://stylekit.top) 上，也提供 MCP、命令行工具和配套 Skill，让 AI 编码工具可以按需读取。
@@ -81,11 +81,7 @@ npx skills@latest update stylekit
 
 这次迁移由 Skills 安装器替换旧文件；如果你改过旧版 Skill，先另存这些改动。接入新版以后，自更新检查会保护本地修改。
 
-之后新版 Skill 会要求 Agent 在开始使用时运行自己的更新检查：
-
-```bash
-python3 <skill-root>/scripts/update-skill.py --auto
-```
+之后新版 Skill 会要求 Agent 在开始使用时，到已安装的 StyleKit Skill 目录运行更新检查。具体命令见 [Skill 使用说明](https://github.com/AnxForever/stylekit-skill/blob/main/SKILL.md) 和 [更新脚本源码](https://github.com/AnxForever/stylekit-skill/blob/main/scripts/update-skill.py)。
 
 检查会读取 GitHub 上的 `main`，校验文件哈希后更新，并且只管理 StyleKit Skill 自己的文件。默认最多每 24 小时检查一次；网络不可用时继续使用本地版本。如果发现用户改过 Skill 文件，会跳过整批更新，避免覆盖这些修改。可用 `--disable`、`--enable` 控制自动检查，用 `--force-check` 立即检查一次。
 
