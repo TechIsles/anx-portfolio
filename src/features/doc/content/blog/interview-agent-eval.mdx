@@ -1,0 +1,158 @@
+---
+title: 读懂自己的代码：为什么我不用 LLM 当裁判
+description: 改了 prompt 之后「好像好了一点」不是结论。把能确定的写死成断言，把不能确定的交给盲化人评——确定性评估框架的两层结构与它背后的取舍。
+createdAt: "2026-09-17T20:05:00+08:00"
+updatedAt: "2026-09-17T20:05:00+08:00"
+---
+
+改完 prompt 之后，你会有一个很强的感觉：好像好了一点。
+
+问题是，「好像」不是一个能写进记录的结论。这篇讲的是：怎么把「好像好了一点」变成一句可以复现、可以被别人反驳的话。
+
+## 一、它解决什么问题
+
+想象你换了一副眼镜，觉得看东西清楚了些。
+
+但你没有视力表，也没验光。你只能「感觉」清楚。如果换的是别人的眼镜呢？你连「感觉」都不敢说。
+
+调 prompt 就是这个状态。你改了措辞、加了约束、重排了示例，输出看起来更顺眼了。但你手上没有一把稳定的尺子。
+
+更麻烦的是我原来唯一的测试是 fake 测试——用一个内存里的假 LLM，预先安排好它返回什么。**它什么都证明不了**：假输出的内容是测试作者自己写的，只能证明「管道接对了」，不能证明「模型变好了」。
+
+## 二、不用它会怎样
+
+一个具体到能想象的坏结果：
+
+你把 prompt 改了八版。每一版你都觉得「这版更好」。三个月后用户投诉变多，你想回滚——回滚到哪一版？
+
+你翻记录，找到第三版，因为你对它的印象最好。
+
+这就是凭感觉调参的终局：你回答不了「哪一版最好」，只能回答「哪一版我印象最深」。
+
+## 三、代码是怎么做的
+
+### 1. 把「好」写死成可判定的断言
+
+`packages/resume-agent/src/evaluation/contracts.ts`
+
+一个 EvalCase 长这样：
+
+```ts
+{
+  version: 1,
+  id: 'fictional-platform-engineer',
+  request: { /* JD + 候选人 + 偏好 */ },
+  expectations: { /* 可选 */ },
+  provenance: { /* 可选：案例来源 */ }
+}
+```
+
+`expectations` 里只有六种东西，每一种都是客观可判定的：
+
+| 断言                         | 判定方式              |
+| ---------------------------- | --------------------- |
+| `targetTitle`                | 精确相等              |
+| `minimumRequirementCoverage` | `>=` 阈值             |
+| `minimumMustHaveCoverage`    | `>=` 阈值             |
+| `requiredJobKeywords`        | 关键词转小写后存在    |
+| `requiredWarningCodes`       | warning code 出现过   |
+| `forbiddenWarningCodes`      | warning code 没出现过 |
+
+注意这里没有「简历写得好不好」这一项。 判不了。
+
+Schema 还顺手堵了两个坑：`.strict()` 拒绝多余字段；`superRefine` 拒绝自相矛盾的 case——同一个 warning code 不能既要求出现又要求不出现。
+
+### 2. runner 只认一条缝
+
+```ts
+runEvaluation(cases, execute) -> EvalReport
+```
+
+`packages/resume-agent/src/evaluation/runner.ts:118`
+
+`execute` 是注入进来的函数。runner 完全不认识 Agent 类，只要求它返回一个最小观察面：目标职位、两项 coverage、warning code。
+
+所以同一批 case 可以丢给 DeepSeek、丢给别的模型、或者丢给一个内存 fake。
+
+有一个细节值得单独说：TypeScript 的类型在编译后就消失了。 所以 runner 在 `execute` 返回之后再跑一次 `EvalExecutionResultSchema.safeParse`，把三类失败分开：
+
+| failure code               | 含义                                                       |
+| -------------------------- | ---------------------------------------------------------- |
+| `execution_failed`         | `execute` 抛异常或拒绝                                     |
+| `invalid_execution_result` | 返回了，但不是合法观察结果（NaN、越界 coverage、空 title） |
+| `assertion_failed`         | 结果合法，但断言没过                                       |
+
+一个 case 通过的条件是一句话：`assertions.every(a => a.passed)`。
+
+### 3. 只跑一次不算数
+
+`packages/resume-agent/src/evaluation/campaign.ts`
+
+`runEvaluationCampaign` 在 runner 外面包了一层重复采样，配置里固定 provider、model、promptRevision、runtimeRevision。
+
+它输出 Wilson 95% 区间，而不是简单的「通过率 ± 一点」——小样本时普通区间会算到 `[0, 1]` 外面，出现「通过率 -20%」这种不可能的数。
+
+我仓库里有两组真实数据：
+
+- 一次 campaign：`passRate = 0.1667`，Wilson 区间 `[0.0301, 0.5635]`
+- 修完匹配器后：`passRate = 0.6667`，Wilson 区间 `[0.3, 0.9032]`
+
+第一组区间横跨 0.03 到 0.56。翻译成人话：3 个 case 跑 2 次，什么都说明不了。
+
+这就是区间存在的意义——它逼你不要拿一次结果下结论，哪怕那次结果很好看。
+
+### 4. 质量交给盲化人评
+
+确定性断言能查职位名、关键词、覆盖率、warning code，但查不了「是否忠于候选人事实」「是否把 JD 重点放对位置」。
+
+这些只能人看。所以有了 `human-review.ts`：四个维度 `factual_fidelity` / `requirement_focus` / `evidence_specificity` / `clarity`，四级评分 `meets` / `minor_issue` / `major_issue` / `not_assessable`。
+
+关键在 blinding（盲化）：评审只看到一个 `blind-xxx` 的 ID，不知道它是哪个模型、哪版 prompt 生成的。
+
+为什么重要？因为知道「这是新版本」之后，你会不自觉地去找支持「新版更好」的证据。这是人的默认设置。
+
+Schema 层面直接把它堵死：
+
+- `blindedVariantId` 必须以 `blind-` 开头
+- `reviewerPseudonym` 必须以 `reviewer-` 开头
+- strict object 拒绝 `notes` 之类的自由文本
+- 同一 reviewer 对同一 case + variant 只能评一次
+- 汇总报告不返回 assignment ID 和 reviewer pseudonym
+
+### 5. 为什么先不上 LLM judge
+
+我读了 OpenAI 的 Evaluation best practices。它自己就列了 LLM judge 的位置偏差和冗长偏差，并要求先验证 judge 与人工标签的一致性，再扩大使用。
+
+我现在没有人工 gold labels、没有经过校准的 rubric、没有一致性数据。
+
+这时候加一个 judge，只是引入第二个没校准的随机模型——用一个不确定的东西去衡量另一个不确定的东西。
+
+## 四、面试官会追问什么
+
+> Q：那你现在怎么知道改了 prompt 变好了？
+>
+> 分两层。确定性断言回答「有没有变差」：同一批 case、同一份 execute，覆盖率和 warning code 可比。质量有没有变好，靠盲化人评。两层都不回答「绝对好不好」——没有绝对。
+
+> Q：Wilson 区间是什么？为什么不用普通的？
+>
+> 普通区间在小样本和极端比例（0/3、3/3）会跑出 `[0, 1]`；Wilson 把中心往 0.5 拉一点再算，所以永远落在范围内。代价是区间更宽——但这个「宽」是诚实的，它反映的就是样本不足。
+
+> Q：fake 测试和真实 eval 差在哪？
+>
+> fake 的输出是测试作者预先安排好的，只能证明 Schema、seam、断言、聚合、脱敏按契约工作，不能证明模型在真实 JD 上表现如何。所以文档里写的状态是「Implemented for development」，不是「质量达标」。
+
+> Q：为什么 provider 和 model 不能写进 case？
+>
+> case 是题目，provider/model/prompt 是谁在做题。混在一起，换模型就得改 case，case 就没法复用了；分开之后，同一批题目才能横向比较不同配置。
+
+## 五、一句话版本
+
+> 用不确定的东西去衡量不确定的东西，只会得到双倍的不确定。先把能确定的写死成断言，剩下的才交给人。
+
+## 六、自测
+
+1. 为什么 EvalCase 里不设一个「resume 质量分」字段？
+2. `invalid_execution_result` 和 `execution_failed` 为什么要分成两类？
+3. blinding 防的具体是什么偏差？如果评审知道了版本号，结论会往哪个方向偏？
+4. 3 个 case、重复 2 次、通过 1 次——这个结果能说明什么，不能说明什么？
+5. 什么条件下才应该引入 LLM judge？

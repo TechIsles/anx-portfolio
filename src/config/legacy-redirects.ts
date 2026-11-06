@@ -16,87 +16,20 @@ export const LEGACY_REDIRECTS = [
   { source: "/projects", destination: "/", permanent: true },
   { source: "/about", destination: "/", permanent: true },
   {
-    source: "/blog/interview-scale-answer",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-project-grilling",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-real-questions",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-mcp-drawbacks",
-    destination: "/blog",
-    permanent: true,
-  },
-  { source: "/blog/interview-prep-roi", destination: "/blog", permanent: true },
-  {
-    source: "/blog/interview-stylekit-deploy",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-stylekit-embedding-cache",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-stylekit-rag-defect",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-stylekit-hybrid-search",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
     source: "/blog/interview-stylekit-mcp",
-    destination: "/blog",
+    destination: "/blog/stylekit-mcp-tools",
     permanent: true,
   },
   {
     source: "/blog/interview-agent-evidence",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-agent-hitl",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-agent-eval",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-agent-lease",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-agent-outbox",
-    destination: "/blog",
-    permanent: true,
-  },
-  {
-    source: "/blog/interview-agent-run-store",
-    destination: "/blog",
+    destination: "/blog/evidence-id",
     permanent: true,
   },
   {
     source: "/blog/interview-agent-structured-output",
-    destination: "/blog",
+    destination: "/blog/structured-output",
     permanent: true,
   },
-  { source: "/blog/interview-start", destination: "/blog", permanent: true },
   {
     source: "/blog/ai-tool-handbook-start",
     destination: "/blog",

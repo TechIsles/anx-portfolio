@@ -1,0 +1,171 @@
+---
+title: 读懂自己的代码：Agent 什么时候该停下来问，而不是编
+description: 模型缺信息时不会说「我不知道」，它会给你一个合理的答案。讲讲怎么在代码里规定暂停的时机、提问的契约，以及答案怎么写回候选人资料。
+createdAt: "2026-09-17T20:06:00+08:00"
+updatedAt: "2026-09-17T20:06:00+08:00"
+---
+
+模型缺信息的时候不会说「我不知道」，它会给你一个听起来很合理的答案。
+
+这篇讲的是怎么在代码里给它规定：什么时候必须停下来问人。
+
+## 一、它解决什么问题
+
+你让实习生帮忙整理简历，给了他一堆零散材料：工作经历、项目、技能。
+
+材料里没写你哪年毕业的。
+
+他会怎么办？
+
+A：空着，跑来问你。
+B：看到你 2019 年入职第一份工作，推算「2021 年毕业」，填上去。
+
+B 更聪明，也更省事——你不用被打扰。
+
+但如果推算错了，面试官一句「你是 2021 年毕业的？」就能让你卡住。
+
+**LLM 的默认行为是 B。** 它被训练成「给出完整答案」，不是「承认自己不知道」——它不缺能力，缺的是一个「可以不知道」的出口。
+
+## 二、不用它会怎样
+
+一个具体到能想象的坏结果：
+
+JD 要求 Kubernetes，候选人材料里完全没提。模型为了让简历更贴岗位，合理地补了一条集群迁移的经历。
+
+用户没逐字检查，投了。面试官照着简历问细节。
+
+这就是 hallucination 在简历场景里的形态——它替你撒了一个会被当场戳穿的谎。
+
+## 三、代码是怎么做的
+
+### 1. 先给模型一个合法的出路
+
+`packages/resume-agent/src/input/candidate.ts` 里的归一化 system prompt：
+
+```text
+Extract only facts supported by the uploaded candidate material.
+Never invent employers, titles, dates, technologies, metrics, or achievements.
+...
+If a fact is missing or ambiguous, omit it and add a follow-up question.
+```
+
+草拟阶段的 prompt 同理：
+
+```text
+If a requirement has no support, leave it unmatched and ask a question instead of guessing.
+```
+
+这两句不是「请不要编造」这种道德劝说，它给的是一个明确、可执行的替代动作：**omit + ask**。
+
+模型缺信息时有一个合法出口，它才不会去走非法出口。
+
+### 2. 问题分三级，但只有一个会拦下流程
+
+`FollowUpQuestionSchema` 的形状：
+
+```ts
+{
+  field: string,
+  question: string,
+  reason: string,
+  severity: 'blocking' | 'important' | 'optional',
+  control?: InteractionControl
+}
+```
+
+`packages/resume-agent/src/workflow/run.ts` 里的判断：
+
+```ts
+const interactions = createInteractionRequests(checkpoint.questions).filter(
+  (interaction) => interaction.severity !== "optional"
+)
+if (interactions[0]) {
+  await this.pause(id, checkpoint, interactions, heartbeat)
+  return
+}
+```
+
+两个关键决定：
+
+- **optional 不暂停。** 它只是被记下来，最后出现在结果的 `questions` 里。否则用户会被一堆「要不要补充一下兴趣爱好」烦死。
+- **一次只问一个。** 暂停时待回答的交互可能有多个，但公开快照只暴露 `interactions[0]`。
+
+顺序由 `createInteractionRequests` 定：`blocking = 0`、`important = 1`、`optional = 2`，最严重的排最前。
+
+### 3. 提问是一份契约，不是一段自然语言
+
+`packages/resume-agent/src/workflow/interaction.ts` 定义了十种控件：`single_choice`、`multi_choice`、`text`、`textarea`、`number`、`date`、`date_range`、`url`、`file`、`confirm`。
+
+每个请求带上 `field`、`prompt`、`reason`、`required`、`severity`、`privacy`、`control`。前端按协议渲染，不解析问题文本猜控件。
+
+隐私等级由字段推导：`email` / `phone` 是 `sensitive`，其它 `content.basics.*` 和 `content.location.*` 是 `personal`，剩下 `standard`。
+
+控件默认值也由字段推导：字段名以 `.url` 结尾 → url 控件；`.summary` 或 `.description` → textarea；否则一律 text。
+
+最后这条是踩过坑的。代码里留着注释：Resume 的日期可能只有年份或月份，没有精度元数据时用文本兜底，**避免逼用户编一个「日」**。
+
+换句话说：不确定精度就不要给日期选择器，因为它会强迫用户填一个他根本不知道的日期。这个设计错误和幻觉是同一个病。
+
+### 4. 回答怎么回灌进流程
+
+`applyInteractionAnswer` 做了七件事：
+
+1. 路径必须以 `content.` 开头，至少三段
+2. 拒绝 `__proto__`、`prototype`、`constructor`
+3. 数组索引必须已经存在（不允许回答凭空创建结构）
+4. 按控件类型校验值的类型与范围
+5. 在 clone 上写入，不碰原对象
+6. 写完必须再通过一次 `ResumeSchema`
+7. 从校验后的对象里按路径读回来，断言等于你写的值
+
+第 6、7 步合起来干一件事：保证答案真的进到了候选人资料里，而不是写进一个 schema 不认识的地方。
+
+### 5. 恢复时不能重跑一遍
+
+状态机里，`needs_input` 只能走到 `analyzing_jd` 或 `failed`：
+
+```text
+normalizing_candidate -> needs_input -> analyzing_jd
+                      -> analyzing_jd
+```
+
+归一化成功后会保存 checkpoint：已提取的 artifacts、归一化候选人、JD 文本、偏好、warnings、trace、待回答交互、checkpoint 版本。
+
+恢复时从 checkpoint 重建 evidence，直接进 `analyzing_jd`——**文件提取和候选人归一化不会再跑一次**，否则你要为一次提问付两遍模型钱。
+
+### 6. 幂等、去重和隐私
+
+回答带一个 `idempotencyKey`：同一个 key + 同样的值重试 → 返回当前 Run；同一个 key + 不同的值 → 稳定失败（`idempotency_conflict`）。
+
+存的不是回答原文，是 SHA-256 指纹。过期交互、错误状态、非法值各有错误码：`stale_interaction`、`run_not_waiting_for_input`、`invalid_answer`。
+
+还有个小动作：回答后会把这条问题从 checkpoint 里移除，否则已回答的问题会重新出现在最终结果的 `questions` 里，用户会以为没生效。
+
+## 四、面试官会追问什么
+
+> Q：为什么一次只问一个？一次问完不是更快吗？
+>
+> 这是产品决策。一次甩出八个问题，用户会直接关掉页面；一次问一个，用户只需要面对「现在这一个」。至于「更慢」——暂停不花时间，重复提取和归一化才花，而那个我避开了。
+
+> Q：如果模型该问却没问呢？
+>
+> 这是真实的剩余风险。当前契约保证「模型提了问题会被正确处理」，不保证「模型一定会提出正确的问题」。后续 eval 需要分别衡量提问必要性、控件选择准确率、恢复成功率，和不必要提问率。
+
+> Q：用户同时提交两个回答会怎样？
+>
+> 现在会出问题。内存 adapter 的「读取 → 校验 → 保存」不是原子事务，两个并发回答可能都通过校验并重复调度；生产实现需要版本号或 compare-and-set。这条写在文档的 Remaining gap 里。
+
+> Q：为什么回答只能写 `content.*`？
+>
+> 因为 `layouts`、`computed` 是渲染配置，不是候选人事实。如果回答能改它们，用户就能靠答一个问题改变输出结构。而且路径是字符串拼出来的，原型污染必须先堵住。
+
+## 五、一句话版本
+
+> 让模型「别编」是没有用的。有用的做法是给它一个合法出路，并把那个出路的形状提前定死。
+
+## 六、自测
+
+1. prompt 给模型的替代动作是什么？为什么光说「不要编造」没用？
+2. `optional` 的问题为什么不应该暂停 Run？
+3. 「写完再过一次 ResumeSchema」和「写回后按路径读回来比对」，分别在防什么问题？
+4. 恢复时为什么不能重新执行归一化？

@@ -1,0 +1,113 @@
+---
+title: 读懂自己的代码：Outbox —— 改状态和发通知怎么才能不漏
+description: 本地事务和外部副作用没法原子提交。用一张 outbox 表把两者绑进同一个事务，再用幂等键把至少一次投递收敛成效果上的恰好一次。
+createdAt: "2026-09-17T20:03:00+08:00"
+updatedAt: "2026-09-17T20:03:00+08:00"
+---
+
+这个系列是我回头读自己项目代码的记录。这是第三篇，也是我觉得最值得讲的一篇：两个必须同时发生、却没法同时完成的动作。
+
+## 一、它解决什么问题
+
+先讲个柜台的故事。
+
+你去银行转账。柜员说：「钱已经从你账户扣了，我待会儿给你发条短信。」结果他下班忘了。→ 账变了，通知没有。
+
+反过来更糟：柜员先给你发了条短信「转账成功」，再回柜台办手续，系统这时候崩了。→ 通知说成功了，账没变。
+
+这两件事在计算机里叫 dual write：**本地数据库事务**和**外部副作用**，没有办法合并成一个原子操作。而「更新 Run 状态」和「让 worker 去执行这个 Run」恰好就是这样一对。
+
+项目里的具体样子（`packages/resume-agent/src/workflow/run.ts`）：先 `compareAndSet` 提交状态，成功后再调用内存里的 `schedule()` 把任务排进队列。
+
+```ts
+const updated = await this.store.compareAndSet(nextStoredRun)
+if (!updated) return this.resolveAnswerConflict(...)
+this.schedule(() => this.executeCompletion(id))   // 崩在这里就永远没人执行
+```
+
+## 二、不用它会怎样
+
+用户提交了最后一个问题的答案，界面显示「正在生成简历」。
+
+进程在提交成功、`schedule()` 之前崩了。重启之后：数据库里 status 已经是 `analyzing_jd`，checkpoint 和回答回执都在，**但没有任何人知道还有个任务要跑**。Run 就永远停在那里，界面永远转圈。
+
+这不是假设。文档里把这条记成了明确的缺口，并且用「禁用 schedule 后重新打开 Store」的测试复现过：Run 会永久卡在 queued。
+
+反过来的顺序同样不安全：先发任务，worker 可能在状态还没提交（甚至已经回滚）的时候读到半成品数据。
+
+## 三、代码是怎么做的
+
+**把「发通知」也写进数据库。** outbox 模式的核心就一句话：不要直接发通知，而是在同一个事务里写一条「待发送」的记录，再由别人去发。
+
+> 找代码时注意：项目里没有任何生产文件叫 outbox。这个模式在这里体现为 `workflow/sqlite-run-store.ts` 里的 `resume_agent_tasks` 表，加上 `workflow/run.ts` 里的 `createWithTask` / `compareAndSetWithTask` 两个方法。「outbox」这个名字只出现在文档和测试里——直接搜代码会搜不到，按上面两个位置找。
+
+项目在 schema v2 里加了这么一张表（`workflow/sqlite-run-store.ts`）：
+
+```sql
+CREATE TABLE IF NOT EXISTS resume_agent_tasks (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('prepare', 'complete')),
+  created_at INTEGER NOT NULL,
+  available_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT, lease_expires_at INTEGER,
+  FOREIGN KEY (run_id) REFERENCES resume_agent_runs(id) ON DELETE CASCADE
+) STRICT;
+```
+
+状态和任务绑进同一个事务。这是全篇最关键的一段：
+
+```ts
+this.database.exec("BEGIN IMMEDIATE")
+// 1. 写 Run（条件写，revision 必须匹配）
+// 2. 写 task
+this.database.exec("COMMIT")
+```
+
+`createWithTask`（创建 Run + prepare 任务）和 `compareAndSetWithTask`（提交新状态 + complete 任务）都走这个模式。任何一步失败就整体 ROLLBACK：**要么两者都在，要么两者都不在**，中间没有窗口。
+
+任务 ID 是确定性的：`${runId}:${kind}:${targetRevision}`。同一个 mutation 重复入队时会撞主键，直接被数据库拒绝，不会产生两个任务。
+
+任务里不带任何正文。只有 id、runId、kind、时间。worker 拿到 task 后只凭 runId 回去读可信的存储记录——这样既不会出现数据副本，也不会出现「用旧 payload 覆盖新状态」。
+
+投递是至少一次。执行完调用 `acknowledgeTask` 删掉任务；失败则 `releaseTask` 放回去。因为崩溃可能发生在「活干完了」和「任务删掉」之间，所以同一个任务被执行两次是完全可能的。
+
+那怎么收敛成「效果上的恰好一次」？靠状态幂等，不靠队列：
+
+| 场景                   | 去重手段                                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 用户重复提交同一个回答 | `idempotencyKey` + 答案指纹（`sha256([interactionId, value])`）存进 `answerReceipts`；同 key 同值直接返回当前结果，同 key 不同值报 `idempotency_conflict` |
+| 任务被重放             | 已经是 `completed` / `failed` / `needs_input` 的 Run 直接视为已完成，只 ack 不再调模型                                                                    |
+| 重放进了 prepare 阶段  | 已有 checkpoint 就跳过已完成的阶段，状态机也不允许倒退                                                                                                    |
+
+项目文档里对这一点写得很老实：ack 丢失后的重放只确认终态，不会再次调用模型；但落在非终态阶段的重复 LLM 调用仍可能发生——这是明确写下的剩余限制，而不是被含糊过去。
+
+## 四、面试官会追问什么
+
+> Q：为什么不在事务里直接调 HTTP 发通知？
+> A：外部调用不能回滚。发出了就是发出了，事务回滚也收不回来。而且外部调用很慢，会让数据库写锁持有一整个网络往返。
+
+> Q：都有消息队列了，还需要 outbox 吗？
+> A：需要。队列解决的是「怎么送」，解决不了「写库和发消息怎么原子」。生产环境的做法通常是 outbox 表 + 投递进程把记录推给 MQ，消费端仍然要幂等。
+
+> Q：至少一次投递怎么变成恰好一次？
+> A：不承诺 exactly-once。做法是让重复执行变成无害：幂等键去重、终态判定、状态机不倒流。效果上是恰好一次，机制上仍是至少一次。
+
+> Q：任务表里为什么干脆不存 JD 和简历？
+> A：避免数据副本和隐私扩散，也避免旧 payload 覆盖新状态。任务只是一张「去读 runId 对应的记录并干活」的便签。
+
+## 五、一句话版本
+
+> 本地状态和外部副作用无法原子提交，就把「要发通知」这件事也写进同一个事务：**先记下来，再去发；发重了也不怕。**
+
+## 六、自测
+
+1. 什么是 dual write？「先改库再通知」和「先通知再改库」分别崩在哪一步？
+2. outbox 表为什么必须和业务记录在同一个事务里写入？
+3. 任务 ID 用 `runId + kind + revision` 拼出来，解决了什么问题？
+4. 至少一次投递下，项目用哪三种手段让重复执行变得无害？
+5. 如果 ack 失败了会怎样？系统会不会谎报成功？
+
+上一篇：[读懂自己的代码（二）：Agent 任务跑一半崩了怎么办](/blog/interview-agent-run-store)
+下一篇：[读懂自己的代码（四）：租约与心跳 —— 任务为什么不会永远卡死](/blog/interview-agent-lease)

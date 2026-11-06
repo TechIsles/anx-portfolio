@@ -1,0 +1,114 @@
+---
+title: 读懂自己的代码：租约与心跳 —— 任务为什么不会永远卡死
+description: 租约是一把会自动过期的锁。一条原子 SQL 抢任务，心跳续租，失租后由数据库裁决写权限，卡死的任务才有自动恢复的可能。
+createdAt: "2026-09-17T20:04:00+08:00"
+updatedAt: "2026-09-17T20:04:00+08:00"
+---
+
+上一篇讲了 outbox：任务不会丢（[改状态和发通知怎么才能不漏](/blog/interview-agent-outbox)）。但「不会丢」只解决了一半，这一篇讲另一半：任务不会永远卡死，也不会被两个人同时干。
+
+## 一、它解决什么问题
+
+想象公司里只有一间会议室，门口挂个牌子：谁把工牌挂上去，谁在用。
+
+问题是：有人开完会直接走了，工牌还挂在门上。后面的人看着牌子以为有人在用，等一整天。
+
+要解决它，牌子得写两样东西：是谁的，以及到几点为止。到点了人还没回来，牌子自动作废，别人可以进去。
+
+这就是 lease（租约）：一把**有期限的锁**。对应的还有心跳——人还坐在里面，就每隔一会儿把牌子上的到期时间往后挪，证明自己没走。
+
+## 二、不用它会怎样
+
+两个坏结果，方向正好相反。
+
+**没有租约**：两个 worker 同时轮询同一张任务表，都读到那条 ready 的任务。没有租约的话，两边各自开始跑同一个 Run——用户付两份 token，跑两遍模型。
+
+**只有租约、没有到期时间**：worker 进程被 OOM 杀掉（连 catch 都来不及跑），任务永远挂着「正在执行」。队列里其他任务照跑，只有这一个永远停在那里，没有任何自动恢复路径。
+
+如果再加上「持有者只是进程里挂了个定时器假装还在」——也就是没有真正的心跳——那连「它到底死没死」都判断不了。
+
+## 三、代码是怎么做的
+
+一、抢任务必须是原子的。 `packages/resume-agent/src/workflow/sqlite-run-store.ts` 里用一条 `UPDATE ... RETURNING` 完成「挑一个 + 写归属 + 记一次投递」：
+
+```sql
+UPDATE resume_agent_tasks
+SET lease_owner = ?, lease_expires_at = ?, attempts = attempts + 1
+WHERE id = (
+  SELECT candidate.id FROM resume_agent_tasks AS candidate
+  WHERE candidate.available_at <= ?
+    AND (candidate.lease_owner IS NULL OR candidate.lease_expires_at <= ?)
+    AND NOT EXISTS (
+      SELECT 1 FROM resume_agent_tasks AS active
+      WHERE active.run_id = candidate.run_id
+        AND active.lease_owner IS NOT NULL
+        AND active.lease_expires_at > ?
+    )
+  ORDER BY candidate.available_at, candidate.created_at, candidate.id
+  LIMIT 1
+) RETURNING ...
+```
+
+三个条件分别对应三件事：能跑（`available_at` 到点）、没人占或已经过期（可以接管）、同一个 Run 没有别的活跃任务（一个 Run 是串行状态机，不能 prepare 和 complete 同时跑）。
+
+注意这是**一条语句**。先 `SELECT` 再 `UPDATE` 会让两个 worker 都选中同一行——检查和使用之间就是那个经典竞态。
+
+二、`attempt` 是投递代数。每次 claim 都会 `attempts + 1`，ack 和 release 必须同时匹配任务 id、owner 和 attempt。否则一个卡了很久的旧 worker，可能把别人刚抢到的租约给「确认」掉。
+
+三、续租有两条硬规则（`renewTaskLease`）：
+
+```sql
+UPDATE resume_agent_tasks
+SET lease_expires_at = MAX(lease_expires_at, ?)   -- 新到期时间
+WHERE id = ? AND run_id = ? AND lease_owner = ? AND attempts = ?
+  AND lease_expires_at > ?                        -- 已过期就不能续
+```
+
+- **过期的租约不能续**。否则一个卡住的 worker 醒来就能无限复活自己的锁，任务永远不会被接管。
+- 新的到期时间是 `max(旧值, 现在 + 租期)`。基准取「现在」而不是「旧到期时间」，否则每次心跳都把恢复延迟往后堆，最后越来越久。
+
+四、心跳是单飞的。 `workflow/run.ts` 里的 `RunTaskLeaseHeartbeat` 每 `taskLeaseMs / 3` 续一次（默认租期 60 秒，即每 20 秒），而且续租请求排在同一条串行队列上——上一轮还没回来就不会再发一轮。任务开始执行时会先续租一次：因为任务从被抢到真正开始跑之间可能排队了一会儿，这一下既确认自己没失租，也重新拿到完整的租期窗口。
+
+五、光在内存里标记「我失租了」不够。这是我最想记住的一点。检查 `leaseLost` 和真正写库之间还有一个时间差，正好够租约过期、别人接管、然后你把自己的旧结果写进去。
+
+所以写入条件被下沉到数据库里（`compareAndSetForTask`），返回值分三态：
+
+| 结果                | 含义                   | 处理                               |
+| ------------------- | ---------------------- | ---------------------------------- |
+| `updated`           | 写入成功               | 继续跑                             |
+| `revision_conflict` | 别人改了同一份记录     | 重读重算，最多 3 次                |
+| `lease_lost`        | 自己已经不是当前持有者 | 立刻停手：不写、不 ack、不 release |
+
+`lease_lost` 之后旧 worker 抛一个内部信号直接终止，已经发出去的模型请求就让它跑完，结果丢弃。
+
+六、卡死的任务要有个头。 `maxTaskAttempts` 默认 3。第 4 次抢到时，如果 Run 还活着，就把它标记为失败（`agent_task_attempts_exhausted`），避免一条毒任务被无限重放。文档特意说明：这不叫 DLQ，因为没有独立的死信存储可以检查或重投。
+
+七、还有个轮询器兜底。启动时的恢复只覆盖「进程启动」那一刻；运行中才写入的任务、或者被 release 的任务，需要有人一直看着。`startWorker()` 用一个定时器每轮最多抢一个任务（默认间隔 1 秒），`close()` 时清理。
+
+## 四、面试官会追问什么
+
+> Q：lease 就是分布式锁吗？
+> A：是「会自动过期的锁」。区别在于它会失效、会被接管，所以拿到锁不等于只有你一个人干过这件事——必须配合幂等。
+
+> Q：那把租期调长一点不就行了？
+> A：租期越长，worker 崩溃后任务被接管得越晚。心跳的作用就是把「我还活着」和「租期多长」解耦。
+
+> Q：为什么过期的租约不允许续租？
+> A：这是防僵尸。允许续租的话，一个卡住很久的 worker 醒来还能续上，任务就永远不会回到队列。
+
+> Q：只在内存里判断失租有什么问题？
+> A：TOCTOU——判断和写入之间有时间差。所以项目把 revision 和租约条件放进同一条 SQL，让数据库来裁决。
+
+## 五、一句话版本
+
+> 抢任务靠一条原子 SQL，续命靠心跳，失租后由数据库裁决写权限：**租约保证的只是「此刻只有一个人」，不代表「只执行过一次」。**
+
+## 六、自测
+
+1. 为什么抢任务不能用「先 SELECT 再 UPDATE」？项目的做法是什么？
+2. `attempt` 有什么用？ack 为什么必须带上它？
+3. 心跳的两个约束——「过期不能续」和「基准取现在」——各自防止了什么？
+4. `compareAndSetForTask` 的三个返回值分别对应什么处理？
+5. 超过最大尝试次数后，项目做了什么？为什么不叫 DLQ？
+
+上一篇：[读懂自己的代码（三）：Outbox —— 改状态和发通知怎么才能不漏](/blog/interview-agent-outbox)

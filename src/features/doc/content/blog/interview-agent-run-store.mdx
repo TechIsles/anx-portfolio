@@ -1,0 +1,121 @@
+---
+title: 读懂自己的代码：Agent 任务跑一半崩了怎么办
+description: 把 Run 状态从内存搬进 SQLite：revision 条件写挡住 lost update，checkpoint 让重启后的任务不用从头再来。
+createdAt: "2026-09-17T20:02:00+08:00"
+updatedAt: "2026-09-17T20:02:00+08:00"
+---
+
+上一篇讲的是模型输出不可信（[为什么 LLM 返回的 JSON 不能信](/blog/structured-output)）。这一篇换个方向：就算模型每次都乖乖返回，进程自己崩了怎么办。
+
+## 一、它解决什么问题
+
+打游戏的时候，你会存档。
+
+不存档的后果大家都知道：打到最后一关，断电，全部重来。更烦的是那种「打到一半让你回答问题」的游戏——你选了 A，游戏崩了，重开后它又问你一遍。
+
+Agent 任务一模一样。生成一份定制简历要几十秒：读文件、归一化简历、分析 JD、匹配证据、起草、校验、渲染。中间还可能停下来问用户「这段经历的时间是不是写错了」。
+
+最初的实现把这些状态放在一个 `Map` 里（`packages/resume-agent/src/workflow/run.ts` 的 `InMemoryRunStore`）。进程一重启，Map 就空了：用户点开链接，Run 不见了；用户刚回答完的问题，也没了，只能从头再来一遍。
+
+## 二、不用它会怎样
+
+还有一个更隐蔽的坏结果，跟崩溃无关。
+
+两个人（或两个请求）同时读同一份 Run，各自校验、各自写回。后写的那个把先写的覆盖掉了，先写的那次回答凭空消失。这叫 lost update，是并发写最经典的坑。
+
+在代码里它表现为：`get → 校验 → save` 这三步之间没有任何保护。
+
+所以要做的事有两件：**状态要落盘**，**写要有版本条件**。
+
+## 三、代码是怎么做的
+
+先补版本号。内部记录长这样（`workflow/run.ts`）：
+
+```ts
+interface StoredResumeAgentRun {
+  revision: number // 内部版本，不对外暴露
+  snapshot: ResumeAgentRun // 对外可见的那一份
+  request?: TailorResumeRequest
+  checkpoint?: ResumeTailoringCheckpoint
+  pendingInteractions?: InteractionRequest[]
+  answerReceipts?: InteractionAnswerReceipt[]
+}
+```
+
+写入接口叫 `compareAndSet(run)`：只有当前记录的 revision 与传入的一致，才写入，并把 revision 加一。这样两个并发请求只有一个能成功，失败的重新读一遍再决定。
+
+再落盘。 `workflow/sqlite-run-store.ts` 用 Node 内置的 `node:sqlite`（Node 22 自带）落了一张表：
+
+```sql
+CREATE TABLE IF NOT EXISTS resume_agent_runs (
+  id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  record_json TEXT NOT NULL CHECK (json_valid(record_json))
+) STRICT;
+```
+
+几个刻意的选择：
+
+| 选择                                 | 为什么                                       |
+| ------------------------------------ | -------------------------------------------- |
+| revision 单独做一列，不从 JSON 里读  | 条件写可以压成数据库的一条语句               |
+| `PRAGMA user_version` 记 schema 版本 | 版本比代码新就直接拒绝，不猜结构             |
+| WAL + `synchronous = FULL`           | 读可以并行，同时优先保证「提交了就真的落盘」 |
+| 异常统一转成 `RunStoreError`         | 只带原因码，不透传 SQLite 原始消息           |
+
+条件写就是那条 UPDATE：
+
+```sql
+UPDATE resume_agent_runs SET revision = ?, record_json = ?
+WHERE id = ? AND revision = ?;
+```
+
+`changes === 1` 就是成功，`0` 就是冲突或不存在。检查和写入由数据库一次完成，应用层没有窗口。
+
+状态机是显式的。允许的流转写在一张表里：`queued → ingesting_inputs → normalizing_candidate → needs_input / analyzing_jd → … → completed / failed`。另有一张 `ACTIVE_STATUS_RANK`，防止并发的旧回调把状态往回推——没有它，一个迟到的「分析中」回调能把已经完成的 Run 改回去。
+
+checkpoint 是恢复的关键。 `prepare` 阶段跑完就把中间结果存进 `checkpoint`；如果流程停下来问用户，状态变成 `needs_input`，Run 和问题一起落盘。用户回答后从 checkpoint 继续，**不重跑已经完成的阶段**。
+
+启动顺序也是设计的一部分（`packages/resume-agent-api/src/server.ts`）：
+
+```ts
+ownedStore = await createRuntimeStore(env)
+runService = new ResumeAgentRunService(agent, { store: ownedStore.store })
+const recoveredTasks = await runService.recoverPendingTasks(recoveryLimit)
+server = createAgentApiServer({ ... })
+await listen(server, port, host)
+runService.startWorker()
+```
+
+先开存储、再恢复未完成任务、再开始监听，最后启动轮询。顺序错了就会漏任务。
+
+**对外只给 snapshot。** `service.get(id)` 只返回 `ResumeAgentRun`，revision、原始 request、checkpoint、回答回执都不公开。
+
+## 四、面试官会追问什么
+
+> Q：为什么不用 JSON 文件或者 Redis？
+> A：核心需求是「条件写」——revision 匹配才允许改。文件做不到原子条件写；SQLite 天然是单写者 + serializable 隔离，一条 `UPDATE ... WHERE revision = ?` 就够。换 Redis 也得自己实现同样的 CAS。
+
+> Q：重启后为什么不干脆重跑整个任务？
+> A：两个原因。LLM 调用要钱要时间；更关键的是用户已经回答过的问题不能再问一遍，checkpoint 就是为这个存在的。
+
+> Q：revision 在列里也存，JSON 里也有，不是冗余吗？
+> A：列是给条件写用的，JSON 是记录内容。读取时会校验两者一致，不一致直接按 `corrupt_record` 处理，而不是信任其中一个。
+
+> Q：为什么公开对象里没有 checkpoint？
+> A：隐私边界。checkpoint 里有 JD、简历和用户回答的原文，属于内部数据；对外只需要「任务到哪一步了」。
+
+## 五、一句话版本
+
+> Agent 的状态必须落盘并带版本号：**revision 保证不被覆盖，checkpoint 保证不用重来。**
+
+## 六、自测
+
+1. 什么是 lost update？`get → 校验 → save` 为什么挡不住它？
+2. `compareAndSet` 返回 0 行代表哪两种可能？调用方该怎么处理？
+3. checkpoint 和 Run snapshot 分别解决什么问题？
+4. 为什么需要 `ACTIVE_STATUS_RANK` 这种「状态不能倒退」的规则？
+5. 服务启动顺序为什么必须「恢复任务」在「开始监听」之前？
+
+上一篇：[读懂自己的代码（一）：为什么 LLM 返回的 JSON 不能信](/blog/structured-output)
+下一篇：[读懂自己的代码（三）：Outbox —— 改状态和发通知怎么才能不漏](/blog/interview-agent-outbox)
