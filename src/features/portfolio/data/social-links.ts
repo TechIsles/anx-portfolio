@@ -22,6 +22,12 @@ export const SOCIAL = {
     href: "https://github.com/AnxForever",
     sameAs: true,
   },
+  huggingface: {
+    title: "Hugging Face",
+    handle: "AnxForever",
+    href: "https://huggingface.co/AnxForever",
+    sameAs: true,
+  },
   xiaohongshu: {
     title: "小红书",
     handle: "AnxForever",
